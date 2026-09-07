@@ -74,7 +74,16 @@ def client():
     return OpenAI(api_key=key, base_url=BASE_URL)
 
 
-def ask(system_prompt: str, user_content: str, max_tokens: int = 4000) -> str:
+# A long ITT produces a long requirements array. The first real document this
+# was tested on blew through a 4,000-token output cap and returned JSON that
+# stopped mid-object, which the parser rejected outright - the whole run lost
+# because the last item was incomplete. Two changes came out of that: a much
+# higher ceiling, and a parser that salvages the complete objects rather than
+# discarding everything. A partial scope the user is warned about beats no scope.
+MAX_OUTPUT_TOKENS = 8000
+
+
+def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
     """One call to the model. Temperature 0 so the same document gives the same
     scope twice - a procurement tool that changes its mind between runs is
     useless to the person relying on it."""
@@ -95,23 +104,50 @@ def ask(system_prompt: str, user_content: str, max_tokens: int = 4000) -> str:
             "your provider currently offers."
         )
         st.stop()
+
+    # finish_reason == "length" means the model was cut off mid-sentence.
+    # Record it so the interface can say so instead of quietly under-reporting.
+    if getattr(resp.choices[0], "finish_reason", None) == "length":
+        st.session_state["truncated"] = True
+
     return resp.choices[0].message.content
 
 
 def parse_json(raw: str):
     """Models sometimes wrap JSON in markdown fences or add a sentence before it.
-    Strip that off rather than letting the whole pipeline fail on formatting."""
+    Strip that off rather than letting the whole pipeline fail on formatting.
+
+    If the response was truncated mid-array, keep the objects that did complete
+    instead of throwing the run away. Losing the last requirement is recoverable;
+    losing all forty is not."""
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     start = min([i for i in (text.find("["), text.find("{")) if i != -1], default=-1)
     if start > 0:
         text = text[start:]
+
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        st.error(f"Could not read the model's response as JSON: {e}")
-        st.stop()
+    except json.JSONDecodeError:
+        pass
+
+    # Salvage: cut back to the last complete object and close the array.
+    if text.lstrip().startswith("["):
+        cut = text.rfind("}")
+        if cut != -1:
+            try:
+                salvaged = json.loads(text[:cut + 1] + "]")
+                st.session_state["truncated"] = True
+                return salvaged
+            except json.JSONDecodeError:
+                pass
+
+    st.error(
+        "The model's response could not be read as JSON, and no complete records "
+        "could be salvaged from it. Try a shorter document, or paste one section."
+    )
+    st.stop()
 
 
 # ---------------------------------------------------------------- stage 1
@@ -243,6 +279,7 @@ def read_input(uploaded_file, pasted_text):
 
 def analyse(doc_text):
     """The four stages, in order. Each hands structured data to the next."""
+    st.session_state["truncated"] = False
     steps = st.status("Analysing tender…", expanded=True)
 
     with steps:
@@ -259,6 +296,15 @@ def analyse(doc_text):
         gaps = stage_gaps(doc_text, reqs)
 
     steps.update(label="Analysis complete", state="complete", expanded=False)
+
+    if st.session_state.get("truncated"):
+        st.warning(
+            "**This document was too long to process whole.** The model hit its output "
+            "limit, so the results below are complete but not exhaustive — later "
+            "requirements may be missing. For a full analysis, paste one section at a time.",
+            icon="⚠️",
+        )
+
     return reqs, gaps
 
 
