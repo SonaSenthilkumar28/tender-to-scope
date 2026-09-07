@@ -23,7 +23,9 @@ its own pass over the original text.
 
 import json
 import os
+import random
 import re
+import time
 
 import streamlit as st
 from openai import OpenAI
@@ -83,34 +85,57 @@ def client():
 MAX_OUTPUT_TOKENS = 8000
 
 
+# Transient failures are the tax on a multi-stage pipeline. Each stage is another
+# chance for the provider to return "high demand, try later", and on a free tier
+# that is common. With four stages, a 5% per-call failure rate means roughly one
+# run in five dies - and it dies after the earlier stages have already done their
+# work. Retrying the one call that failed is far cheaper than redoing the run.
+RETRY_ON = (429, 500, 502, 503, 504)
+MAX_ATTEMPTS = 4
+
+
 def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
-    """One call to the model. Temperature 0 so the same document gives the same
-    scope twice - a procurement tool that changes its mind between runs is
-    useless to the person relying on it."""
-    try:
-        resp = client().chat.completions.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            temperature=0,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-        )
-    except Exception as e:
-        st.error(
-            f"Model call failed (`{MODEL}` at `{BASE_URL}`): {e}\n\n"
-            "If this is a model-not-found error, set `MODEL` in Secrets to one "
-            "your provider currently offers."
-        )
-        st.stop()
+    """One call to the model, retried with exponential backoff on transient errors.
 
-    # finish_reason == "length" means the model was cut off mid-sentence.
-    # Record it so the interface can say so instead of quietly under-reporting.
-    if getattr(resp.choices[0], "finish_reason", None) == "length":
-        st.session_state["truncated"] = True
+    Temperature 0 so the same document gives the same scope twice - a procurement
+    tool that changes its mind between runs is useless to the person relying on it."""
+    last_error = None
 
-    return resp.choices[0].message.content
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            resp = client().chat.completions.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            if getattr(resp.choices[0], "finish_reason", None) == "length":
+                st.session_state["truncated"] = True
+            return resp.choices[0].message.content
+
+        except Exception as e:
+            last_error = e
+            status = getattr(e, "status_code", None)
+
+            # 400/401/404 will fail identically however many times we ask.
+            if status is not None and status not in RETRY_ON:
+                break
+
+            if attempt < MAX_ATTEMPTS - 1:
+                wait = 2 ** attempt + random.uniform(0, 1)   # 1s, 2s, 4s + jitter
+                st.write(f"Provider busy, retrying in {wait:.0f}s…")
+                time.sleep(wait)
+
+    st.error(
+        f"Model call failed after {MAX_ATTEMPTS} attempts "
+        f"(`{MODEL}` at `{BASE_URL}`): {last_error}\n\n"
+        "A 503 means the provider is under load - wait a minute and try again. "
+        "A model-not-found error means `MODEL` in Secrets needs updating."
+    )
+    st.stop()
 
 
 def parse_json(raw: str):
@@ -148,6 +173,25 @@ def parse_json(raw: str):
         "could be salvaged from it. Try a shorter document, or paste one section."
     )
     st.stop()
+
+
+# A real ITT produced 83 requirements. Sending all 83 into one enrichment call
+# and asking for 83 enriched objects back overruns any sane output limit - and
+# the salvage path then silently drops the tail of the list. Batching keeps each
+# response comfortably inside the ceiling, and turns one fragile call into
+# several independent ones, so a failure costs a batch rather than the run.
+BATCH_SIZE = 25
+
+
+def run_batched(system_prompt, records):
+    """Enrich a list of requirements in batches, preserving order."""
+    out = []
+    batches = [records[i:i + BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
+    for n, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            st.write(f"  batch {n} of {len(batches)}")
+        out.extend(parse_json(ask(system_prompt, json.dumps(batch, indent=2))))
+    return out
 
 
 # ---------------------------------------------------------------- stage 1
@@ -195,7 +239,7 @@ def stage_classify(reqs):
             {**reqs[1], "category": "Service Level", "deliverable": "Availability SLA", "priority": "Mandatory"},
             {**reqs[2], "category": "Implementation", "deliverable": "Training programme", "priority": "Mandatory"},
         ]
-    return parse_json(ask(CLASSIFY_SYS, json.dumps(reqs, indent=2)))
+    return run_batched(CLASSIFY_SYS, reqs)
 
 
 # ---------------------------------------------------------------- stage 3
@@ -223,7 +267,7 @@ def stage_assess(reqs):
             {**reqs[1], "testable": False, "issue": "'core hours' is never defined"},
             {**reqs[2], "testable": False, "issue": "'all staff' is not quantified and no training format is given"},
         ]
-    return parse_json(ask(ASSESS_SYS, json.dumps(reqs, indent=2)))
+    return run_batched(ASSESS_SYS, reqs)
 
 
 # ---------------------------------------------------------------- stage 4
