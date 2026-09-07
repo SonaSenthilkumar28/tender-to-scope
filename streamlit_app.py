@@ -66,7 +66,7 @@ def setting(key: str, default: str = "") -> str:
 
 
 BASE_URL = setting("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-MODEL = setting("MODEL", "gemini-2.5-flash")
+MODEL = setting("MODEL", "gemini-3.5-flash-lite")
 MOCK = setting("MOCK") == "1"          # lets the UI be tested with no API key
 
 
@@ -100,6 +100,29 @@ RETRY_ON = (429, 500, 502, 503, 504)
 MAX_ATTEMPTS = 4
 
 
+def http_status(exc) -> int | None:
+    """Dig the HTTP status out of an exception.
+
+    Not every client library puts it in the same place, and a 404 that arrives
+    with status_code unset was being retried four times as though it were
+    transient - burning quota on an error that could never succeed. Falling back
+    to the response object, then to the message text, makes the retry decision
+    depend on what actually happened rather than on how the SDK happened to
+    package it."""
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+
+    match = re.search(r"[Ee]rror code:\s*(\d{3})", str(exc))
+    return int(match.group(1)) if match else None
+
+
 def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
     """One call to the model, retried with exponential backoff on transient errors.
 
@@ -124,7 +147,7 @@ def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKE
 
         except Exception as e:
             last_error = e
-            status = getattr(e, "status_code", None)
+            status = http_status(e)
 
             # A 429 is ambiguous: per-minute throttling is worth waiting out,
             # a per-day quota is not. Retrying a daily limit just burns three
@@ -140,7 +163,10 @@ def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKE
                 st.stop()
 
             # 400/401/404 will fail identically however many times we ask.
-            if status is not None and status not in RETRY_ON:
+            # Default to NOT retrying when the status can't be determined:
+            # a wasted retry on a permanent error costs quota and time, while
+            # failing fast on a transient one only costs the user a button press.
+            if status not in RETRY_ON:
                 break
 
             if attempt < MAX_ATTEMPTS - 1:
@@ -148,12 +174,19 @@ def ask(system_prompt: str, user_content: str, max_tokens: int = MAX_OUTPUT_TOKE
                 st.write(f"Provider busy, retrying in {wait:.0f}s…")
                 time.sleep(wait)
 
-    st.error(
-        f"Model call failed after {MAX_ATTEMPTS} attempts "
-        f"(`{MODEL}` at `{BASE_URL}`): {last_error}\n\n"
-        "A 503 means the provider is under load - wait a minute and try again. "
-        "A model-not-found error means `MODEL` in Secrets needs updating."
-    )
+    final_status = http_status(last_error)
+    if final_status == 404:
+        hint = ("That model does not exist or has been retired. Set `MODEL` in Secrets "
+                "to one your provider currently offers — the error above usually names "
+                "the replacement.")
+    elif final_status in (401, 403):
+        hint = "That is an authentication failure - check `LLM_API_KEY` in Secrets."
+    elif final_status in RETRY_ON:
+        hint = "The provider is under load. Wait a minute and try again."
+    else:
+        hint = "Check `MODEL`, `LLM_BASE_URL` and `LLM_API_KEY` in Secrets."
+
+    st.error(f"Model call failed (`{MODEL}` at `{BASE_URL}`): {last_error}\n\n{hint}")
     st.stop()
 
 
@@ -389,8 +422,8 @@ st.title("Tender-to-Scope Analyser")
 st.markdown(
     "Turns a procurement document into a structured delivery scope, then flags what is "
     "ambiguous, missing or contradictory **before** anyone commits to delivering it.\n\n"
-    "*Four stages: extract requirements verbatim → structure them into deliverables → "
-    "test whether each one is measurable → re-read the document for what is absent.*"
+    "*Three stages: extract requirements verbatim → structure them into deliverables "
+    "and test whether each is measurable → re-read the document for what is absent.*"
 )
 
 left, right = st.columns([1, 2], gap="large")
