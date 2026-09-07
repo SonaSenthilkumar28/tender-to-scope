@@ -25,7 +25,6 @@ import json
 import os
 import re
 
-import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
@@ -327,7 +326,7 @@ with right:
 
         st.subheader("Structured scope")
         st.dataframe(
-            pd.DataFrame([{
+            [{
                 "ID": r.get("id", ""),
                 "Requirement": r.get("requirement", ""),
                 "Category": r.get("category", ""),
@@ -335,20 +334,20 @@ with right:
                 "Priority": r.get("priority", ""),
                 "Testable": "Yes" if r.get("testable") else "No",
                 "Issue": r.get("issue", ""),
-            } for r in reqs]),
+            } for r in reqs],
             use_container_width=True, hide_index=True,
         )
 
         st.subheader("Gaps, contradictions and questions to ask")
         st.caption("Every question below should be answered by the buyer before this is priced.")
         st.dataframe(
-            pd.DataFrame([{
+            [{
                 "Severity": g.get("severity", ""),
                 "Type": g.get("type", ""),
                 "Finding": g.get("finding", ""),
                 "Risk to supplier": g.get("risk", ""),
                 "Question for the buyer": g.get("question", ""),
-            } for g in gaps]),
+            } for g in gaps],
             use_container_width=True, hide_index=True,
         )
     else:
